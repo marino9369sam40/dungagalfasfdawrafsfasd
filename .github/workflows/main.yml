@@ -1,1 +1,117 @@
 
+name: Run verifier image
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Write updates (true) or dry-run (false)"
+        required: true
+        type: choice
+        options:
+          - "false"
+          - "true"
+        default: "false"
+      dataset_id:
+        description: "Dataset id (empty = latest complete)"
+        required: false
+        type: string
+        default: ""
+      limit:
+        description: "Optional active-row cap for a smoke test"
+        required: false
+        type: string
+        default: ""
+      threads:
+        description: "Worker threads"
+        required: false
+        type: string
+        default: "3"
+      image_tag:
+        description: "Docker image tag to pull"
+        required: false
+        type: string
+        default: "tagname"
+
+jobs:
+  verify:
+    name: Verify datapoints
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: vance93sneed9011
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull verifier image
+        run: docker pull vance93sneed9011/ik6xvq:${{ inputs.image_tag || 'tagname' }}
+
+      - name: Run verifier
+        env:
+          VERIFY_POSTGRES_URI: ${{ secrets.VERIFY_POSTGRES_URI }}
+          INPUT_APPLY: ${{ inputs.apply }}
+          INPUT_DATASET_ID: ${{ inputs.dataset_id }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+          INPUT_THREADS: ${{ inputs.threads }}
+          IMAGE_TAG: ${{ inputs.image_tag || 'tagname' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VERIFY_POSTGRES_URI:-}" ]; then
+            echo "VERIFY_POSTGRES_URI secret is required" >&2
+            exit 1
+          fi
+          ARGS=(--report /app/out/verify-report.jsonl --sleep-s 0.35)
+          case "${INPUT_THREADS:-3}" in
+            ''|*[!0-9]*)
+              echo "threads must be a positive integer" >&2
+              exit 1
+              ;;
+          esac
+          ARGS+=(--threads "${INPUT_THREADS:-3}")
+          if [ "${INPUT_APPLY}" = "true" ]; then
+            ARGS+=(--apply)
+          else
+            ARGS+=(--dry-run)
+          fi
+          if [ -n "${INPUT_DATASET_ID}" ]; then
+            case "${INPUT_DATASET_ID}" in
+              ''|*[!0-9]*)
+                echo "id must be a positive integer" >&2
+                exit 1
+                ;;
+            esac
+            ARGS+=(--dataset-id "${INPUT_DATASET_ID}")
+          fi
+          if [ -n "${INPUT_LIMIT}" ]; then
+            case "${INPUT_LIMIT}" in
+              ''|*[!0-9]*)
+                echo "limit must be a positive integer" >&2
+                exit 1
+                ;;
+            esac
+            ARGS+=(--limit "${INPUT_LIMIT}")
+          fi
+          docker rm -f verify-ci >/dev/null 2>&1 || true
+          set +e
+          docker run --name verify-ci \
+            -e VERIFY_POSTGRES_URI \
+            vance93sneed9011/ik6xvq:"${IMAGE_TAG}" \
+            "${ARGS[@]}"
+          VERIFY_EXIT=$?
+          set -e
+          docker cp verify-ci:/app/out/verify-report.jsonl "${GITHUB_WORKSPACE}/verify-report.jsonl" \
+            || true
+          docker rm -f verify-ci >/dev/null 2>&1 || true
+          exit "${VERIFY_EXIT}"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report
+          path: verify-report.jsonl
+          if-no-files-found: warn

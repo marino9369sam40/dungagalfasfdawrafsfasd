@@ -1,4 +1,3 @@
-
 name: Run verifier image
 
 on:
@@ -32,13 +31,23 @@ on:
         required: false
         type: string
         default: "tagname"
+      auto_restart:
+        description: "Automatically trigger the next run (true/false)"
+        required: false
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
 
 jobs:
   verify:
     name: Verify datapoints
     runs-on: ubuntu-latest
+    # Leave time after the 340-minute verifier cycle for cleanup and dispatch.
     timeout-minutes: 360
     permissions:
+      actions: write
       contents: read
     steps:
       - name: Log in to Docker Hub
@@ -51,6 +60,8 @@ jobs:
         run: docker pull vance93sneed9011/ik6xvq:${{ inputs.image_tag || 'tagname' }}
 
       - name: Run verifier
+        shell: bash
+        timeout-minutes: 345
         env:
           VERIFY_POSTGRES_URI: ${{ secrets.VERIFY_POSTGRES_URI }}
           INPUT_APPLY: ${{ inputs.apply }}
@@ -60,6 +71,11 @@ jobs:
           IMAGE_TAG: ${{ inputs.image_tag || 'tagname' }}
         run: |
           set -euo pipefail
+          cleanup() {
+            docker rm -f verify-ci >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
           if [ -z "${VERIFY_POSTGRES_URI:-}" ]; then
             echo "VERIFY_POSTGRES_URI secret is required" >&2
             exit 1
@@ -80,7 +96,7 @@ jobs:
           if [ -n "${INPUT_DATASET_ID}" ]; then
             case "${INPUT_DATASET_ID}" in
               ''|*[!0-9]*)
-                echo "id must be a positive integer" >&2
+                echo "dataset_id must be a positive integer" >&2
                 exit 1
                 ;;
             esac
@@ -97,21 +113,93 @@ jobs:
           fi
           docker rm -f verify-ci >/dev/null 2>&1 || true
           set +e
-          docker run --name verify-ci \
+          timeout --signal=TERM --kill-after=30s 340m docker run --name verify-ci \
             -e VERIFY_POSTGRES_URI \
             vance93sneed9011/ik6xvq:"${IMAGE_TAG}" \
             "${ARGS[@]}"
           VERIFY_EXIT=$?
           set -e
+          # Ensure the container has stopped before copying its report.
+          docker stop --time 30 verify-ci >/dev/null 2>&1 || true
           docker cp verify-ci:/app/out/verify-report.jsonl "${GITHUB_WORKSPACE}/verify-report.jsonl" \
             || true
-          docker rm -f verify-ci >/dev/null 2>&1 || true
+          if [ "$VERIFY_EXIT" -eq 124 ]; then
+            echo "Verifier reached the 340-minute cycle limit; continuing to restart step."
+            exit 0
+          fi
           exit "${VERIFY_EXIT}"
 
       - name: Upload report
         if: always()
+        timeout-minutes: 5
         uses: actions/upload-artifact@v4
         with:
           name: verify-report
           path: verify-report.jsonl
           if-no-files-found: warn
+
+      - name: Trigger next verifier run
+        # A manual cancellation stops the loop.
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_APPLY: ${{ inputs.apply || 'false' }}
+          INPUT_DATASET_ID: ${{ inputs.dataset_id }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+          INPUT_THREADS: ${{ inputs.threads || '3' }}
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag || 'tagname' }}
+          INPUT_AUTO_RESTART: ${{ inputs.auto_restart || 'true' }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [ "$INPUT_AUTO_RESTART" != "true" ]; then
+            echo "Auto-restart is disabled. Stopping."
+            exit 0
+          fi
+
+          WORKFLOW_PATH="${WORKFLOW_REF#${REPO}/}"
+          WORKFLOW_PATH="${WORKFLOW_PATH%@*}"
+          WORKFLOW_FILE="${WORKFLOW_PATH##*/}"
+          if [ -z "$WORKFLOW_FILE" ]; then
+            echo "Error: could not determine the current workflow file." >&2
+            exit 1
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg ref "$REF" \
+            --arg apply "$INPUT_APPLY" \
+            --arg dataset_id "$INPUT_DATASET_ID" \
+            --arg limit "$INPUT_LIMIT" \
+            --arg threads "$INPUT_THREADS" \
+            --arg image_tag "$INPUT_IMAGE_TAG" \
+            '{ref: $ref, inputs: {apply: $apply, dataset_id: $dataset_id,
+              limit: $limit, threads: $threads, image_tag: $image_tag,
+              auto_restart: "true"}}')
+
+          echo "Triggering next verifier run from ${WORKFLOW_FILE}..."
+          RESPONSE_FILE="${RUNNER_TEMP}/workflow-dispatch-response.json"
+          HTTP_CODE=$(curl --silent --show-error \
+            --connect-timeout 15 --max-time 120 \
+            --output "$RESPONSE_FILE" \
+            --write-out "%{http_code}" \
+            --request POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+            --data "$PAYLOAD")
+
+          if [ "$HTTP_CODE" = "204" ]; then
+            echo "Next verifier run triggered successfully (HTTP ${HTTP_CODE})."
+          else
+            echo "Error: workflow dispatch returned HTTP ${HTTP_CODE}." >&2
+            if [ -s "$RESPONSE_FILE" ]; then
+              cat "$RESPONSE_FILE" >&2
+            fi
+            exit 1
+          fi

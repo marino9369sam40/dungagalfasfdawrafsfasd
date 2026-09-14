@@ -1,200 +1,71 @@
-name: Smart Crawler (build image or crawl)
+name: Run Smart Crawler image
 
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "Build/push image or run the crawler"
-        required: true
-        type: choice
-        options:
-          - crawl
-          - build
-        default: crawl
-      image_tag:
-        description: "Docker Hub tag (build mode only)"
-        required: true
-        type: string
-        default: latest
-      run_id:
-        description: "Required for crawl: existing sealed crawl_v2 run ID"
-        required: false
-        type: string
-      threads:
-        description: "Worker threads"
-        required: true
-        type: string
-        default: "3"
-      qps:
-        description: "Shared search requests per second"
-        required: true
-        type: string
-        default: "2"
       image:
-        description: "Docker Hub image tag or digest; blank uses SMART_CRAWLER_IMAGE variable/default"
-        required: false
+        description: "Docker image (empty = repository variable/default)"
         type: string
         default: ""
+      threads:
+        description: "Worker threads"
+        type: string
+        default: "3"
+      run_key:
+        description: "Keep unchanged to resume; change to start a new crawl"
+        type: string
+        default: smart-national-v3
       auto_restart:
-        description: "Continue in a new workflow after the 300-minute cycle"
-        required: true
+        description: "Continue after each five-hour crawl cycle"
         type: choice
-        options:
-          - "true"
-          - "false"
+        options: ["true", "false"]
         default: "true"
-
-# Serializes the same DB run even if this template is installed under two filenames.
-concurrency:
-  group: smart-crawl-${{ github.repository }}-${{ inputs.mode }}-${{ inputs.mode == 'build' && inputs.image_tag || inputs.run_id }}
-  cancel-in-progress: false
 
 permissions:
   contents: read
   actions: write
 
+concurrency:
+  group: smart-crawl-${{ github.repository }}-${{ inputs.run_key || 'smart-national-v3' }}
+  cancel-in-progress: false
+
 jobs:
-  docker:
-    if: ${{ inputs.mode == 'build' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Resolve build context and image
-        id: config
-        shell: bash
-        env:
-          INPUT_TAG: ${{ inputs.image_tag }}
-          IMAGE_REPOSITORY: ${{ vars.SMART_CRAWLER_IMAGE_REPOSITORY || 'vance93sneed9011/smart-crawler-v6' }}
-        run: |
-          set -euo pipefail
-          if [ -f smart-crawler-v6/Dockerfile ]; then
-            CONTEXT=smart-crawler-v6
-          elif [ -f Dockerfile ] && [ -f crawl_cycle.py ]; then
-            CONTEXT=.
-          else
-            echo 'Cannot find Smart Crawler Docker build context.' >&2
-            exit 1
-          fi
-          python3 - <<'PY'
-          import os, re
-          if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', os.environ['INPUT_TAG']):
-              raise SystemExit('Invalid image tag')
-          if not re.fullmatch(r'[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*', os.environ['IMAGE_REPOSITORY']):
-              raise SystemExit('Use a Docker Hub namespace/repository')
-          PY
-          echo "context=$CONTEXT" >> "$GITHUB_OUTPUT"
-          echo "image=$IMAGE_REPOSITORY:$INPUT_TAG" >> "$GITHUB_OUTPUT"
-          echo "revision_image=$IMAGE_REPOSITORY:sha-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and test Linux image
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ steps.config.outputs.context }}
-          file: ${{ steps.config.outputs.context }}/Dockerfile
-          platforms: linux/amd64
-          load: true
-          tags: smart-crawler-v6:ci
-          cache-from: type=gha,scope=smart-crawler-v6
-          cache-to: type=gha,mode=max,scope=smart-crawler-v6
-
-      - name: Smoke-test entrypoint and non-root user
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker run --rm smart-crawler-v6:ci --help
-          docker run --rm smart-crawler-v6:ci enqueue --help
-          test "$(docker run --rm --entrypoint id smart-crawler-v6:ci -u)" = 10001
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME || 'vance93sneed9011' }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push tested image
-        shell: bash
-        env:
-          IMAGE: ${{ steps.config.outputs.image }}
-          REVISION_IMAGE: ${{ steps.config.outputs.revision_image }}
-        run: |
-          set -euo pipefail
-          docker tag smart-crawler-v6:ci "$IMAGE"
-          docker tag smart-crawler-v6:ci "$REVISION_IMAGE"
-          docker push "$IMAGE"
-          docker push "$REVISION_IMAGE"
-
   crawl:
-    if: ${{ inputs.mode == 'crawl' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    # First start also downloads the latest PBF and creates the queue.
+    timeout-minutes: 360
     steps:
-      - name: Validate inputs
-        shell: bash
-        env:
-          INPUT_RUN_ID: ${{ inputs.run_id }}
-          INPUT_THREADS: ${{ inputs.threads }}
-          INPUT_QPS: ${{ inputs.qps }}
-          IMAGE: ${{ inputs.image || vars.SMART_CRAWLER_IMAGE || 'vance93sneed9011/smart-crawler-v6:latest' }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import math, os, re
-          for key in ('INPUT_RUN_ID', 'INPUT_THREADS'):
-              value = os.environ[key]
-              if not re.fullmatch(r'[1-9][0-9]*', value):
-                  raise SystemExit(f'{key} must be a positive integer without leading zeros')
-          qps = float(os.environ['INPUT_QPS'])
-          if not math.isfinite(qps) or qps <= 0:
-              raise SystemExit('qps must be positive and finite')
-          if not re.fullmatch(r'(?:docker.io/)?[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}|@sha256:[a-f0-9]{64})?', os.environ['IMAGE']):
-              raise SystemExit('Invalid Docker image reference')
-          PY
-
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ vars.DOCKERHUB_USERNAME || 'vance93sneed9011' }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Pull and pin crawler image
+      - name: Pull crawler image
         id: image
         timeout-minutes: 10
-        shell: bash
         env:
           IMAGE: ${{ inputs.image || vars.SMART_CRAWLER_IMAGE || 'vance93sneed9011/smart-crawler-v6:latest' }}
         run: |
           set -euo pipefail
           docker pull "$IMAGE"
-          PINNED_IMAGE="$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
-          if [[ "$PINNED_IMAGE" != *@sha256:* ]]; then
-            echo 'Image has no registry digest; refusing an unpinned continuation.' >&2
-            exit 1
-          fi
-          echo "image=$PINNED_IMAGE" >> "$GITHUB_OUTPUT"
+          DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
+          [[ "$DIGEST" == *@sha256:* ]]
+          echo "image=$DIGEST" >> "$GITHUB_OUTPUT"
 
-      - name: Crawl for at most five hours
+      - name: Run crawler (automatically create or resume queue)
         id: cycle
-        timeout-minutes: 310
-        shell: bash
+        timeout-minutes: 345
         env:
           VERIFY_POSTGRES_URI: ${{ secrets.VERIFY_POSTGRES_URI }}
-          INPUT_RUN_ID: ${{ inputs.run_id }}
-          INPUT_THREADS: ${{ inputs.threads }}
-          INPUT_QPS: ${{ inputs.qps }}
-          CRAWLER_IMAGE: ${{ steps.image.outputs.image }}
+          SMART_CRAWLER_PBF_URL: ${{ vars.SMART_CRAWLER_PBF_URL }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          INPUT_THREADS: ${{ inputs.threads || '3' }}
+          INPUT_RUN_KEY: ${{ inputs.run_key || 'smart-national-v3' }}
         run: |
           set -euo pipefail
+          test -n "$VERIFY_POSTGRES_URI" || { echo 'VERIFY_POSTGRES_URI secret is required.' >&2; exit 1; }
           echo 'restart=false' >> "$GITHUB_OUTPUT"
-          if [ -z "${VERIFY_POSTGRES_URI:-}" ]; then
-            echo 'VERIFY_POSTGRES_URI secret is required.' >&2
-            exit 1
-          fi
           CONTAINER="smart-crawl-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cleanup() {
             docker stop --time 90 "$CONTAINER" >/dev/null 2>&1 || true
@@ -202,74 +73,50 @@ jobs:
           }
           trap cleanup EXIT
           set +e
-          timeout --signal=TERM --kill-after=90s 305m \
+          timeout --signal=TERM --kill-after=90s 340m \
             docker run --name "$CONTAINER" --init --stop-timeout 90 \
-              -e VERIFY_POSTGRES_URI "$CRAWLER_IMAGE" \
-              --run-id "$INPUT_RUN_ID" --threads "$INPUT_THREADS" --qps "$INPUT_QPS" \
+              -e VERIFY_POSTGRES_URI -e SMART_CRAWLER_PBF_URL "$IMAGE" \
+              --threads "$INPUT_THREADS" --run-key "$INPUT_RUN_KEY" \
               --max-runtime-minutes 300 --report /app/out/crawl-cycle.json
           CRAWLER_EXIT=$?
           set -e
-          export CRAWLER_EXIT
           docker stop --time 90 "$CONTAINER" >/dev/null 2>&1 || true
-          docker cp "$CONTAINER:/app/out/crawl-cycle.json" "$GITHUB_WORKSPACE/crawl-cycle.json"
-          # An outer timeout/crash is a failure, not proof that a new cycle is safe.
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          report = json.loads(Path('crawl-cycle.json').read_text())
-          if report.get('schema_version') != 1 or report.get('run_id') != int(os.environ['INPUT_RUN_ID']):
-              raise SystemExit('Cycle report schema or run ID does not match')
-          successful = int(os.environ['CRAWLER_EXIT']) == 0 and report.get('exit_code') == 0
-          restart = (successful and report.get('restart_eligible') is True
-                     and report.get('reason') == 'cycle_limit' and report.get('state') == 'running'
-                     and not any(report.get('counts', {}).get(s, 0) for s in ('blocked', 'failed_permanent')))
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f'restart={str(restart).lower()}\n')
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-              f.write('### Smart Crawler cycle\n\n```json\n' + json.dumps(report, indent=2) + '\n```\n')
-          if not successful:
-              raise SystemExit('Crawl stopped with an error or needs attention; see the cycle report')
-          PY
+          docker cp "$CONTAINER:/app/out/crawl-cycle.json" crawl-cycle.json
+          test "$CRAWLER_EXIT" -eq 0
+          jq -e '.schema_version == 1 and .exit_code == 0 and (.run_id > 0)' crawl-cycle.json >/dev/null
+          if jq -e '.restart_eligible == true and .reason == "cycle_limit" and .state == "running"
+              and ((.counts.blocked // 0) == 0) and ((.counts.failed_permanent // 0) == 0)' crawl-cycle.json >/dev/null; then
+            echo 'restart=true' >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload cycle report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: smart-crawl-${{ inputs.run_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: smart-crawl-${{ github.run_id }}-${{ github.run_attempt }}
           path: crawl-cycle.json
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Trigger the next five-hour cycle
+      - name: Trigger next five-hour cycle
         if: ${{ !cancelled() && steps.cycle.outputs.restart == 'true' && inputs.auto_restart == 'true' }}
         timeout-minutes: 5
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           REF: ${{ github.ref_name }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
-          INPUT_RUN_ID: ${{ inputs.run_id }}
-          INPUT_THREADS: ${{ inputs.threads }}
-          INPUT_QPS: ${{ inputs.qps }}
-          PINNED_IMAGE: ${{ steps.image.outputs.image }}
+          INPUT_THREADS: ${{ inputs.threads || '3' }}
+          INPUT_RUN_KEY: ${{ inputs.run_key || 'smart-national-v3' }}
+          IMAGE: ${{ steps.image.outputs.image }}
         run: |
           set -euo pipefail
           WORKFLOW_PATH="${WORKFLOW_REF#${REPO}/}"
-          WORKFLOW_PATH="${WORKFLOW_PATH%@*}"
-          WORKFLOW_FILE="${WORKFLOW_PATH##*/}"
-          if [ -z "$WORKFLOW_FILE" ]; then
-            echo 'Unable to resolve the current workflow filename.' >&2
-            exit 1
-          fi
-          # Structured stdin avoids shell interpolation of JSON or workflow inputs.
-          python3 - <<'PY' > "$RUNNER_TEMP/smart-dispatch.json"
-          import json, os
-          print(json.dumps({'ref': os.environ['REF'], 'inputs': {
-              'mode': 'crawl', 'run_id': os.environ['INPUT_RUN_ID'], 'threads': os.environ['INPUT_THREADS'],
-              'qps': os.environ['INPUT_QPS'], 'image': os.environ['PINNED_IMAGE'],
-              'auto_restart': 'true'}}))
-          PY
+          WORKFLOW_FILE="${WORKFLOW_PATH%@*}"
+          WORKFLOW_FILE="${WORKFLOW_FILE##*/}"
+          jq -n --arg ref "$REF" --arg threads "$INPUT_THREADS" \
+            --arg run_key "$INPUT_RUN_KEY" --arg image "$IMAGE" \
+            '{ref: $ref, inputs: {threads: $threads, run_key: $run_key,
+              image: $image, auto_restart: "true"}}' > "$RUNNER_TEMP/smart-dispatch.json"
           gh api --method POST "repos/$REPO/actions/workflows/$WORKFLOW_FILE/dispatches" \
             --input "$RUNNER_TEMP/smart-dispatch.json"
-          echo 'Next cycle requested with the same run ID and image digest.'

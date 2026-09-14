@@ -80,9 +80,15 @@ jobs:
               --max-runtime-minutes 300 --report /app/out/crawl-cycle.json
           CRAWLER_EXIT=$?
           set -e
+          echo "Crawler exit code: $CRAWLER_EXIT"
+          docker inspect --format 'Container exit={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}}' "$CONTAINER" || true
           docker stop --time 90 "$CONTAINER" >/dev/null 2>&1 || true
-          docker cp "$CONTAINER:/app/out/crawl-cycle.json" crawl-cycle.json
-          test "$CRAWLER_EXIT" -eq 0
+          if ! docker cp "$CONTAINER:/app/out/crawl-cycle.json" crawl-cycle.json; then
+            echo 'Container stopped before producing its report; inspect exit/OOM status above.' >&2
+            jq -n --argjson code "$CRAWLER_EXIT" \
+              '{schema_version: 1, reason: "missing_report", restart_eligible: false, container_exit_code: $code, exit_code: 2}' > crawl-cycle.json
+          fi
+          if [ "$CRAWLER_EXIT" -ne 0 ]; then exit "$CRAWLER_EXIT"; fi
           jq -e '.schema_version == 1 and .exit_code == 0 and (.run_id > 0)' crawl-cycle.json >/dev/null
           if jq -e '.restart_eligible == true and .reason == "cycle_limit" and .state == "running"
               and ((.counts.blocked // 0) == 0) and ((.counts.failed_permanent // 0) == 0)' crawl-cycle.json >/dev/null; then

@@ -53,12 +53,13 @@ jobs:
           [[ "$DIGEST" == *@sha256:* ]]
           echo "image=$DIGEST" >> "$GITHUB_OUTPUT"
 
-      - name: Run crawler (automatically create or resume queue)
+      - name: Prepare way cache then crawl (automatic resume)
         id: cycle
         timeout-minutes: 345
         env:
           VERIFY_POSTGRES_URI: ${{ secrets.VERIFY_POSTGRES_URI }}
           SMART_CRAWLER_PBF_URL: ${{ vars.SMART_CRAWLER_PBF_URL }}
+          SMART_CRAWLER_SOURCE_PBF_URL: ${{ vars.SMART_CRAWLER_SOURCE_PBF_URL }}
           IMAGE: ${{ steps.image.outputs.image }}
           INPUT_THREADS: ${{ inputs.threads || '3' }}
           INPUT_RUN_KEY: ${{ inputs.run_key || 'smart-national-v3' }}
@@ -75,7 +76,8 @@ jobs:
           set +e
           timeout --signal=TERM --kill-after=90s 340m \
             docker run --name "$CONTAINER" --init --stop-timeout 90 \
-              -e VERIFY_POSTGRES_URI -e SMART_CRAWLER_PBF_URL "$IMAGE" \
+              -e VERIFY_POSTGRES_URI -e SMART_CRAWLER_PBF_URL \
+              -e SMART_CRAWLER_SOURCE_PBF_URL "$IMAGE" \
               --threads "$INPUT_THREADS" --run-key "$INPUT_RUN_KEY" \
               --max-runtime-minutes 300 --report /app/out/crawl-cycle.json
           CRAWLER_EXIT=$?

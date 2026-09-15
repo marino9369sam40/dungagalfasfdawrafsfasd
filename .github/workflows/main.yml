@@ -92,7 +92,9 @@ jobs:
           fi
           if [ "$CRAWLER_EXIT" -ne 0 ]; then exit "$CRAWLER_EXIT"; fi
           jq -e '.schema_version == 1 and .exit_code == 0 and (.run_id > 0)' crawl-cycle.json >/dev/null
-          if jq -e '.restart_eligible == true and .reason == "cycle_limit" and .state == "running"
+          if jq -e '.restart_eligible == true
+              and ((.reason == "cycle_limit" and .state == "running")
+                or (.reason == "preparation_limit" and .state == "preparing"))
               and ((.counts.blocked // 0) == 0) and ((.counts.failed_permanent // 0) == 0)' crawl-cycle.json >/dev/null; then
             echo 'restart=true' >> "$GITHUB_OUTPUT"
           fi
